@@ -26,6 +26,7 @@ import packaging.version
 import pandas as pd
 import PIL.Image
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 import torch.utils
@@ -92,6 +93,7 @@ class LeRobotDatasetMetadata:
         self.revision = revision if revision else CODEBASE_VERSION
         self.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
         self.writer = None
+        self._episodes_writer_path: Path | None = None
         self.latest_episode = None
         self.metadata_buffer: list[dict] = []
         self.metadata_buffer_size = metadata_buffer_size
@@ -129,14 +131,57 @@ class LeRobotDatasetMetadata:
 
         table = pa.Table.from_pydict(combined_dict)
 
+        path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check if the file exists on disk and load its schema to handle evolution
+        if path.exists():
+            existing_schema = pq.read_schema(path)
+            
+            # Update schema with new columns from the table
+            for name in table.column_names:
+                if name not in existing_schema.names:
+                    existing_schema = existing_schema.append(table.schema.field(name))
+            
+            # Ensure table matches the updated schema
+            def _cast_table_to_schema(src_table: pa.Table, target_schema: pa.Schema) -> pa.Table:
+                # Add missing columns with nulls
+                for field in target_schema:
+                    if field.name not in src_table.column_names:
+                        null_array = pa.nulls(src_table.num_rows, type=field.type)
+                        src_table = src_table.append_column(field.name, null_array)
+                
+                # Reorder and cast columns
+                new_columns = []
+                for field in target_schema:
+                    idx = src_table.schema.get_field_index(field.name)
+                    col = src_table.column(idx)
+                    if col.type != field.type:
+                        col = pc.cast(col, field.type, safe=False)
+                    new_columns.append(col)
+                
+                return pa.Table.from_arrays(new_columns, schema=target_schema)
+
+            table = _cast_table_to_schema(table, existing_schema)
+
+            # If we can reuse the writer, do so. Otherwise, if the schema changed, we must rewrite the file.
+            # Since we can't easily detect if the writer matches, we rely on checking if self.writer is set.
+            # However, if the file exists but self.writer is None, we must check if we can append.
+            # ParquetWriter(..., append=True) is not supported.
+            # So we read the old table, concat, and write everything back if we are not holding a writer.
+            if not self.writer:
+                 existing_table = pq.read_table(path)
+                 existing_table = _cast_table_to_schema(existing_table, existing_schema)
+                 table = pa.concat_tables([existing_table, table])
+        
         if not self.writer:
-            path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self.writer = pq.ParquetWriter(
+             self.writer = pq.ParquetWriter(
                 path, schema=table.schema, compression="snappy", use_dictionary=True
             )
-
+            
         self.writer.write_table(table)
+
+        self._episodes_writer_path = path
 
         self.latest_episode = self.metadata_buffer[-1]
         self.metadata_buffer.clear()
@@ -360,11 +405,7 @@ class LeRobotDatasetMetadata:
             chunk_idx = self.latest_episode["meta/episodes/chunk_index"][0]
             file_idx = self.latest_episode["meta/episodes/file_index"][0]
 
-            latest_path = (
-                self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
-                if self.writer is None
-                else self.writer.where
-            )
+            latest_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
 
             if Path(latest_path).exists():
                 latest_size_in_mb = get_file_size_in_mb(Path(latest_path))
@@ -533,6 +574,7 @@ class LeRobotDatasetMetadata:
         write_json(obj.info, obj.root / INFO_PATH)
         obj.revision = None
         obj.writer = None
+        obj._episodes_writer_path = None
         obj.latest_episode = None
         obj.metadata_buffer = []
         obj.metadata_buffer_size = metadata_buffer_size
@@ -1201,26 +1243,26 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.meta.load_metadata()
 
         # Get chunk- and file indices from the first episode in the metadata buffer
-        chunk_idx = self.meta.episodes[start_episode]["data/chunk_index"]
-        file_idx = self.meta.episodes[start_episode]["data/file_index"]
+        chunk_idx = int(self.meta.episodes[start_episode]["data/chunk_index"], "chunk_idx")
+        file_idx = int(self.meta.episodes[start_episode]["data/file_index"], "file_idx")
         episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         episode_df = pd.read_parquet(episode_df_path)
 
         for ep_idx in range(start_episode, end_episode):
             logging.info(f"Encoding videos for episode {ep_idx}")
 
-            if (
-                self.meta.episodes[ep_idx]["data/chunk_index"] != chunk_idx
-                or self.meta.episodes[ep_idx]["data/file_index"] != file_idx
-            ):
+            current_chunk_idx = int(self.meta.episodes[ep_idx - start_episode]["data/chunk_index"], "chunk_idx")
+            current_file_idx = int(self.meta.episodes[ep_idx - start_episode]["data/file_index"], "file_idx")
+
+            if current_chunk_idx != chunk_idx or current_file_idx != file_idx:
                 # The current episode is in a new chunk or file.
                 # Save previous episode dataframe and update the Hugging Face dataset by reloading it.
                 episode_df.to_parquet(episode_df_path)
                 self.meta.episodes = load_episodes(self.root)
 
                 # Load new episode dataframe
-                chunk_idx = self.meta.episodes[ep_idx]["data/chunk_index"]
-                file_idx = self.meta.episodes[ep_idx]["data/file_index"]
+                chunk_idx = current_chunk_idx
+                file_idx = current_file_idx
                 episode_df_path = self.root / DEFAULT_EPISODES_PATH.format(
                     chunk_index=chunk_idx, file_index=file_idx
                 )
@@ -1229,7 +1271,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             # Save the current episode's video metadata to the dataframe
             video_ep_metadata = {}
             for video_key in self.meta.video_keys:
-                video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
+                video_ep_metadata.update(self._save_episode_video(video_key, ep_idx, batch_encoding=True))
             video_ep_metadata.pop("episode_index")
             video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
                 dtype_backend="pyarrow"
@@ -1333,7 +1375,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return metadata
 
-    def _save_episode_video(self, video_key: str, episode_index: int) -> dict:
+    def _save_episode_video(self, video_key: str, episode_index: int, latest_episode_meta: dict | None = None, batch_encoding: bool = False) -> dict:
+        """
+        Save episode video to a parquet file and update the Hugging Face dataset of videos data.
+
+        Args:
+            video_key: The key of the video to save
+            episode_index: The index of the episode to save
+            latest_episode_meta: The metadata of the latest episode. If None, the metadata of the latest episode is used.
+
+        Returns:
+            The metadata of the saved episode video.
+        """
+
+        if latest_episode_meta is None:
+            latest_episode_meta = self.meta.latest_episode
+
         # Encode episode frames into a temporary video
         ep_path = self._encode_temporary_episode_video(video_key, episode_index)
         ep_size_in_mb = get_file_size_in_mb(ep_path)
@@ -1346,7 +1403,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ):
             # Initialize indices for a new dataset made of the first episode data
             chunk_idx, file_idx = 0, 0
-            if self.meta.episodes is not None and len(self.meta.episodes) > 0:
+            if self.meta.episodes is not None and len(self.meta.episodes) > 0 and not batch_encoding:
                 # It means we are resuming recording, so we need to load the latest episode
                 # Update the indices to avoid overwriting the latest episode
                 old_chunk_idx = self.meta.episodes[-1][f"videos/{video_key}/chunk_index"]
