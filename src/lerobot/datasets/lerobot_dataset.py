@@ -141,7 +141,10 @@ class LeRobotDatasetMetadata:
         file_idx = first_ep["meta/episodes/file_index"][0]
 
         table = pa.Table.from_pydict(combined_dict)
-
+        # if self.writer:
+            # Force the new table to match the open file's schema
+        #     table = table.select(self.writer.schema.names)
+        #     table = table.cast(self.writer.schema)
         if not self.writer:
             path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
             path.parent.mkdir(parents=True, exist_ok=True)
